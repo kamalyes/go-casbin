@@ -25,6 +25,12 @@ import (
 	"strings"
 )
 
+// TenantHostBinding 租户域名绑定关系
+type TenantHostBinding struct {
+	TenantID string
+	Host     string
+}
+
 const (
 	// domainIdentityAction 正向校验动作
 	domainIdentityAction = "HOST"
@@ -100,6 +106,27 @@ func (e *Enforcer) ResolveTenantByHost(host string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// ListTenantHostBindings 列出租户域名绑定（反向映射策略）
+// tenantID 为空时列出所有租户的绑定，非空时仅列出指定租户的绑定
+func (e *Enforcer) ListTenantHostBindings(tenantID string) []TenantHostBinding {
+	bindings := make([]TenantHostBinding, 0)
+	for _, p := range e.GetFilteredNamedPolicy("p2", 3, hostTenantMapAction) {
+		// p = [v0=sub_rule, v1=tenantID, v2=domain::host, v3=action]
+		if len(p) < 3 || p[1] == "" {
+			continue
+		}
+		if tenantID != "" && p[1] != tenantID {
+			continue
+		}
+		host := strings.TrimPrefix(p[2], domainIdentityResourcePrefix)
+		if host == "" {
+			continue
+		}
+		bindings = append(bindings, TenantHostBinding{TenantID: p[1], Host: host})
+	}
+	return bindings
 }
 
 // addTenantHostBinding 添加租户 host 绑定（正向+反向映射联动，幂等）
