@@ -16,21 +16,48 @@ go-casbin 是一个企业级的权限管理系统，基于 Go 语言开发，深
 - 🔐 **安全脱敏**：集成 desensitize 模块，日志自动脱敏
 - 🧵 **死锁防护**：notifyPolicyChange 移出锁外、SetNotifier 锁外 Close/Subscribe、ExecuteInTransaction 约束文档化
 
+## 💡 为什么自研 go-casbin
+
+> **模型层 100% 兼容官方 PERM 语法**（`model.conf` / `policy.csv` 可直接迁移），自研的是**引擎层与工程化能力**。单租户、单体应用直接用官方 [casbin/casbin](https://github.com/casbin/casbin) 完全够用；但在「多租户 × 多副本部署 × 网关高频鉴权」场景下，官方库存在一系列结构性缺口——每一个缺口都对应本库的一个核心模块
+
+### 官方 Casbin 的痛点与本库的解法
+
+| # | 场景痛点      | 官方 Casbin 的局限                                                | go-casbin 的解法                                                                                                                                          | 对应实现                                                                                              |
+| - | --------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| 1 | 决策热路径性能   | govaluate 反射求值开销大，核心路径无结果缓存、无对象池化                            | matcher 表达式编译为 AST 一次复用、enforceCache 结果缓存（版本号 O(1) 失效）、syncx.Pool 池化零分配、`some(where)` 短路                                                               | `enforcer/matcher.go` `policy/cache.go`                                                           |
+| 2 | 超时取消治理    | `Enforce(...)` 不接收 context，调用方超时后决策 goroutine 无法感知，泄漏只能靠全局兜底 | 全链路 `EnforceContext` / `IsPublicPolicyCtx`，deadline/cancel 感知到每一次决策                                                                                    | `enforcer/enforcer.go`                                                                            |
+| 3 | 策略与业务原子变更 | AutoSave 只写策略自己的表，「用户/角色业务表 + 策略表」的跨表一致性要业务侧手工补偿             | `ExecuteInTransaction` + `TransactionalSyncUserRoles` / `TransactionalDeleteUser` / `TransactionalDeleteRole`，策略变更纳入业务事务边界，要么都成功要么都回滚                  | `enforcer/enforcer.go`                                                                            |
+| 4 | 多副本策略同步   | watcher 生态只广播「策略变了，各自 reload」，无持久化保证、无分主题、无降级路径              | `PolicyNotifier` 接口化通知器：JetStream 持久化不丢事件（Pod 重启期间变更可补齐）、按分片主题增量 reload 而非全量重载、无消息中间件时自动降级单节点                                                          | `policy/pubsub.go` + [go-casbin-nats-adapter](https://github.com/kamalyes/go-casbin-nats-adapter) |
+| 5 | 多租户分片隔离   | gorm-adapter 单表模型，多租户要么全量共表（domain 字段区分，策略多了匹配变慢）要么自管多实例     | Adapter 原生支持每租户独立实例（动态表名 + 自动建表 + 冷启动分片索引同步），上层按需懒加载分片 Enforcer，单次决策集合从「全平台」缩至「单租户」                                                                    | `WithAdapter` + [go-casbin-gorm-adapter](https://github.com/kamalyes/go-casbin-gorm-adapter)      |
+| 6 | 网关三路决策语义  | 只有一条 Enforce 决策路径，「匿名放行 / 认证免鉴权 / 正常鉴权」三路判定要在业务层自己拼          | 内建 `WithPublicPolicies` / `WithAuthSkipPolicies`（SubjectAnonymous / SubjectAuthenticated 内存策略，启动期从代码加载不落库），`IsPublicPolicy` / `IsAuthSkipPolicy` 即决策原语 | `enforcer/options.go`                                                                             |
+| 7 | 企业级可观测性   | 熔断、重试、指标、脱敏日志全部缺位，接入平台体系需自行再包一层                              | breaker + retry 保护下游存储、Prometheus 指标（enforce / cache / breaker 全维度）、go-logger 结构化日志与自动脱敏、monitor 健康检查                                                  | `monitor/` `enforcer/options.go`                                                                  |
+| 8 | 并发正确性     | notify 持锁回调、watcher 持锁 Close 等锁陷阱需使用方自行规避                    | 从设计层面规避：`notifyPolicyChange` 移出锁外、`SetNotifier` 锁外 Close/Subscribe、事务约束显式文档化，`enforcer_deadlock_test.go` 专项回归                                          | `enforcer/enforcer.go`                                                                            |
+
+### 选型建议
+
+```
+单租户 / 单体应用 / 无统一日志监控体系        → 官方 Casbin（社区大、依赖少、开箱即用）
+多租户 SaaS / 多副本部署 / 网关高频鉴权
+/ 已采用 go-toolbox + go-logger 技术栈       → go-casbin（生态深度集成，缺口全部内建）
+```
+
+> 一句话：**不是重造 PERM 模型，而是把官方「一个授权库」升级为「一个平台级权限能力」——分片隔离、事务一致、context 治理、分布式可靠同步、可观测性全部内建**
+
 ## 📖 权限模型对比：ACL vs RBAC vs ABAC vs PBAC
 
 > 理解不同权限模型的本质区别，是正确选择和使用 go-casbin 的前提
 
 ### 核心区别一览
 
-| 维度 | ACL | RBAC | ABAC | PBAC |
+| 维度        | ACL                 | RBAC                      | ABAC                           | PBAC                        |
 | --------- | ------------------- | ------------------------- | ------------------------------ | --------------------------- |
-| **全称** | Access Control List | Role-Based Access Control | Attribute-Based Access Control | Policy-Based Access Control |
-| **核心思想** | 主体 → 资源 的直接映射 | 主体 → 角色 → 资源 的间接映射 | 根据主体/资源/环境的**属性**动态判断 | 根据**策略规则**动态判断 |
-| **判断依据** | 固定的用户-权限对 | 用户所属的角色 | 请求中的属性值 | 策略文件/数据库中的规则 |
-| **策略存储** | 每个资源维护一个访问列表 | 角色-权限表 + 用户-角色表 | 通常不需要策略文件（matcher 写死） | 策略文件/数据库（规则可动态管理） |
-| **灵活性** | ⭐ 最低 | ⭐⭐ 中等 | ⭐⭐⭐⭐ 最高 | ⭐⭐⭐⭐ 最高 |
-| **管理复杂度** | ⭐⭐⭐⭐ 最高（用户多时爆炸） | ⭐⭐ 低 | ⭐⭐⭐ 中等 | ⭐⭐⭐ 中等 |
-| **运行时变更** | 需修改策略 | 需修改角色/策略 | 需修改 matcher（重启） | 修改策略即可（热更新） |
+| **全称**    | Access Control List | Role-Based Access Control | Attribute-Based Access Control | Policy-Based Access Control |
+| **核心思想**  | 主体 → 资源 的直接映射       | 主体 → 角色 → 资源 的间接映射        | 根据主体/资源/环境的**属性**动态判断          | 根据**策略规则**动态判断              |
+| **判断依据**  | 固定的用户-权限对           | 用户所属的角色                   | 请求中的属性值                        | 策略文件/数据库中的规则                |
+| **策略存储**  | 每个资源维护一个访问列表        | 角色-权限表 + 用户-角色表           | 通常不需要策略文件（matcher 写死）          | 策略文件/数据库（规则可动态管理）           |
+| **灵活性**   | ⭐ 最低                | ⭐⭐ 中等                     | ⭐⭐⭐⭐ 最高                        | ⭐⭐⭐⭐ 最高                     |
+| **管理复杂度** | ⭐⭐⭐⭐ 最高（用户多时爆炸）     | ⭐⭐ 低                      | ⭐⭐⭐ 中等                         | ⭐⭐⭐ 中等                      |
+| **运行时变更** | 需修改策略               | 需修改角色/策略                  | 需修改 matcher（重启）                | 修改策略即可（热更新）                 |
 
 ### 本质区别
 
@@ -70,13 +97,13 @@ go-casbin 是一个企业级的权限管理系统，基于 Go 语言开发，深
 
 ### go-casbin 中的对应实现
 
-| 模型 | 模型文件 | 策略文件 | matcher 特点 | 适用场景 |
+| 模型          | 模型文件                           | 策略文件                           | matcher 特点                                            | 适用场景        |
 | ----------- | ------------------------------ | ------------------------------ | ----------------------------------------------------- | ----------- |
-| ACL | `acl_model.conf` | `acl_policy.csv` | `r.sub == p.sub && r.obj == p.obj && r.act == p.act` | 简单系统、用户少 |
-| RBAC | `rbac_model.conf` | `rbac_policy.csv` | `g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act` | 企业内部系统、角色明确 |
-| RBAC Domain | `rbac_with_domains_model.conf` | `rbac_with_domains_policy.csv` | `g(r.sub, p.sub, r.dom) && ...` | 多租户 SaaS |
-| ABAC 属性 | `abac_model.conf` | 不需要 | `r.sub == r.obj.Owner` | 资源所有者判断 |
-| ABAC 规则 | `abac_rule_model.conf` | `abac_rule_policy.csv` | `eval(p.sub_rule) && ...` | 需要动态规则的场景 |
+| ACL         | `acl_model.conf`               | `acl_policy.csv`               | `r.sub == p.sub && r.obj == p.obj && r.act == p.act`  | 简单系统、用户少    |
+| RBAC        | `rbac_model.conf`              | `rbac_policy.csv`              | `g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act` | 企业内部系统、角色明确 |
+| RBAC Domain | `rbac_with_domains_model.conf` | `rbac_with_domains_policy.csv` | `g(r.sub, p.sub, r.dom) && ...`                       | 多租户 SaaS    |
+| ABAC 属性     | `abac_model.conf`              | 不需要                            | `r.sub == r.obj.Owner`                                | 资源所有者判断     |
+| ABAC 规则     | `abac_rule_model.conf`         | `abac_rule_policy.csv`         | `eval(p.sub_rule) && ...`                             | 需要动态规则的场景   |
 
 ### 如何选择？
 
@@ -273,15 +300,15 @@ func main() {
 
 所有示例代码位于 `examples/` 目录，可直接运行验证效果：
 
-| 示例 | 说明 | 运行命令 |
+| 示例                                                                 | 说明                               | 运行命令                                                       |
 | ------------------------------------------------------------------ | -------------------------------- | ---------------------------------------------------------- |
-| [rbac\_basic](examples/rbac_basic/main.go) | RBAC 基本使用：角色继承 + 权限检查 | `go run examples/rbac_basic/main.go` |
-| [abac\_attribute](examples/abac_attribute/main.go) | ABAC 属性匹配：基于资源 Owner 字段判断 | `go run examples/abac_attribute/main.go` |
-| [abac\_rule](examples/abac_rule/main.go) | ABAC 规则策略：eval() 动态求值 + 独立 CSV | `go run examples/abac_rule/main.go` |
-| [acl\_basic](examples/acl_basic/main.go) | ACL 基本使用：无角色的直接权限控制 | `go run examples/acl_basic/main.go` |
-| [rbac\_domains](examples/rbac_domains/main.go) | 多租户 RBAC：域隔离 + 角色管理 API | `go run examples/rbac_domains/main.go` |
-| [enterprise\_multitenant](examples/enterprise_multitenant/main.go) | 企业级多租户：options 组合 + 熔断 + 重试 | `go run examples/enterprise_multitenant/main.go` |
-| [enterprise\_full](examples/enterprise_full/main.go) | 完整企业级：ORM + Redis + 分布式同步（需外部服务） | `go run -tags enterprise examples/enterprise_full/main.go` |
+| [rbac\_basic](examples/rbac_basic/main.go)                         | RBAC 基本使用：角色继承 + 权限检查            | `go run examples/rbac_basic/main.go`                       |
+| [abac\_attribute](examples/abac_attribute/main.go)                 | ABAC 属性匹配：基于资源 Owner 字段判断        | `go run examples/abac_attribute/main.go`                   |
+| [abac\_rule](examples/abac_rule/main.go)                           | ABAC 规则策略：eval() 动态求值 + 独立 CSV   | `go run examples/abac_rule/main.go`                        |
+| [acl\_basic](examples/acl_basic/main.go)                           | ACL 基本使用：无角色的直接权限控制              | `go run examples/acl_basic/main.go`                        |
+| [rbac\_domains](examples/rbac_domains/main.go)                     | 多租户 RBAC：域隔离 + 角色管理 API          | `go run examples/rbac_domains/main.go`                     |
+| [enterprise\_multitenant](examples/enterprise_multitenant/main.go) | 企业级多租户：options 组合 + 熔断 + 重试      | `go run examples/enterprise_multitenant/main.go`           |
+| [enterprise\_full](examples/enterprise_full/main.go)               | 完整企业级：ORM + Redis + 分布式同步（需外部服务） | `go run -tags enterprise examples/enterprise_full/main.go` |
 
 > **注意**：`enterprise_full` 示例需要 MySQL、Redis 等外部服务，使用 `//go:build enterprise` 构建标签隔离，需加 `-tags enterprise` 才会编译。
 
@@ -289,17 +316,17 @@ func main() {
 
 更详细的使用指南和技术文档位于 `docs/` 目录：
 
-| 文档 | 说明 | 路径 |
+| 文档                                  | 说明                 | 路径                          |
 | ----------------------------------- | ------------------ | --------------------------- |
-| [快速开始](docs/quickstart.md) | 一步一步教你使用 go-casbin | `docs/quickstart.md` |
-| [入门指南](docs/getting-started.md) | 从安装到基本使用的完整指南 | `docs/getting-started.md` |
-| [模型配置指南](docs/model-config.md) | 详细的模型配置语法和示例 | `docs/model-config.md` |
-| [策略管理指南](docs/policy-management.md) | 策略的加载、保存、添加、删除和更新 | `docs/policy-management.md` |
-| [角色管理指南](docs/role-management.md) | 角色的创建、继承、查询和管理 | `docs/role-management.md` |
-| [多租户指南](docs/multitenancy.md) | 多租户隔离方案和实现方法 | `docs/multitenancy.md` |
-| [适配器使用指南](docs/adapters.md) | 各种存储适配器的使用方法 | `docs/adapters.md` |
-| [高级特性指南](docs/advanced-features.md) | 熔断、重试、分布式追踪等企业级功能 | `docs/advanced-features.md` |
-| [实时风控与反黑产](docs/risk-control.md) | 实时风险评估和反黑产操作 | `docs/risk-control.md` |
+| [快速开始](docs/quickstart.md)          | 一步一步教你使用 go-casbin | `docs/quickstart.md`        |
+| [入门指南](docs/getting-started.md)     | 从安装到基本使用的完整指南      | `docs/getting-started.md`   |
+| [模型配置指南](docs/model-config.md)      | 详细的模型配置语法和示例       | `docs/model-config.md`      |
+| [策略管理指南](docs/policy-management.md) | 策略的加载、保存、添加、删除和更新  | `docs/policy-management.md` |
+| [角色管理指南](docs/role-management.md)   | 角色的创建、继承、查询和管理     | `docs/role-management.md`   |
+| [多租户指南](docs/multitenancy.md)       | 多租户隔离方案和实现方法       | `docs/multitenancy.md`      |
+| [适配器使用指南](docs/adapters.md)         | 各种存储适配器的使用方法       | `docs/adapters.md`          |
+| [高级特性指南](docs/advanced-features.md) | 熔断、重试、分布式追踪等企业级功能  | `docs/advanced-features.md` |
+| [实时风控与反黑产](docs/risk-control.md)    | 实时风险评估和反黑产操作       | `docs/risk-control.md`      |
 
 ## 🎯 学习路径
 
@@ -320,24 +347,24 @@ func main() {
 
 ### 监控指标
 
-| 指标 | 说明 |
-| ----------------- | -------- |
-| `enforce_total` | 权限检查总次数 |
-| `enforce_success` | 权限检查成功次数 |
-| `enforce_failure` | 权限检查失败次数 |
-| `enforce_latency` | 权限检查延迟 |
-| `policy_updates` | 策略更新次数 |
-| `cache_hits` | 缓存命中次数 |
-| `cache_misses` | 缓存未命中次数 |
-| `cache_version` | 缓存版本号（策略变更递增） |
-| `breaker_state` | 熔断器状态 |
+| 指标                | 说明            |
+| ----------------- | ------------- |
+| `enforce_total`   | 权限检查总次数       |
+| `enforce_success` | 权限检查成功次数      |
+| `enforce_failure` | 权限检查失败次数      |
+| `enforce_latency` | 权限检查延迟        |
+| `policy_updates`  | 策略更新次数        |
+| `cache_hits`      | 缓存命中次数        |
+| `cache_misses`    | 缓存未命中次数       |
+| `cache_version`   | 缓存版本号（策略变更递增） |
+| `breaker_state`   | 熔断器状态         |
 
 ### 测试覆盖
 
-| 包        | 覆盖率    |
-| --------- | ------- |
-| enforcer  | 91.5%   |
-| policy    | 89.3%   |
+| 包        | 覆盖率   |
+| -------- | ----- |
+| enforcer | 91.5% |
+| policy   | 89.3% |
 
 CI 使用 `go test -race -shuffle=on` 确保并发安全和测试顺序无关性，排除 `examples/` 目录
 
