@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/kamalyes/go-casbin/policy"
+	"github.com/kamalyes/go-logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -303,6 +304,7 @@ func BenchmarkEnforceTenantHostBinding(b *testing.B) {
 		WithModelText(domainIdentityModelText),
 		WithAutoSave(true),
 		WithEnabled(true),
+		WithLogger(logger.NewEmptyLogger()),
 	)
 	defer e.Close()
 	_ = e.SyncTenantHostBindings("t001", []string{"admin.example.com"}, nil)
@@ -318,6 +320,7 @@ func BenchmarkEnforceTenantHostBinding_MultiBindings(b *testing.B) {
 		WithModelText(domainIdentityModelText),
 		WithAutoSave(true),
 		WithEnabled(true),
+		WithLogger(logger.NewEmptyLogger()),
 	)
 	defer e.Close()
 
@@ -341,6 +344,7 @@ func BenchmarkResolveTenantByHost(b *testing.B) {
 		WithModelText(domainIdentityModelText),
 		WithAutoSave(true),
 		WithEnabled(true),
+		WithLogger(logger.NewEmptyLogger()),
 	)
 	defer e.Close()
 	_ = e.SyncTenantHostBindings("t001", []string{"admin.example.com"}, nil)
@@ -356,6 +360,7 @@ func BenchmarkResolveTenantByHost_MultiBindings(b *testing.B) {
 		WithModelText(domainIdentityModelText),
 		WithAutoSave(true),
 		WithEnabled(true),
+		WithLogger(logger.NewEmptyLogger()),
 	)
 	defer e.Close()
 
@@ -378,6 +383,7 @@ func BenchmarkSyncTenantHostBindings_AddRemove(b *testing.B) {
 		WithModelText(domainIdentityModelText),
 		WithAutoSave(true),
 		WithEnabled(true),
+		WithLogger(logger.NewEmptyLogger()),
 	)
 	defer e.Close()
 

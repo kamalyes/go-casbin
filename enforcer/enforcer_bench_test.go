@@ -304,14 +304,18 @@ func BenchmarkEnforce_Domain_CacheMiss(b *testing.B) {
 }
 
 // BenchmarkAddPolicy 批量添加策略的写操作吞吐
+// 循环外创建 enforcer，每轮迭代使用不同 rule 走真实写路径（去重检查 + 索引维护 + 适配器写入）
+// 旧版每轮重建 enforcer，78% 耗时耗在模型加载与关闭上，测量严重失真
 func BenchmarkAddPolicy(b *testing.B) {
+	e := newMemoryEnforcerB(b, rbacModelPath)
+
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		e := newMemoryEnforcerB(b, rbacModelPath)
 		_ = e.AddPolicy("alice", fmt.Sprintf("data%d", i), "read")
-		e.Close()
 	}
+	b.StopTimer()
+	e.Close()
 }
 
 // BenchmarkAddGroupingPolicy 批量添加角色分组的性能
@@ -363,8 +367,8 @@ func BenchmarkEnforce_ShortCircuit_vs_NoShortCircuit(b *testing.B) {
 	})
 }
 
-// BenchmarkEnforceCache_CleanupHighCardinality 高基数缓存清理性能
-// 填充大量不同 key 的缓存条目后触发清理，验证 cleanupEnforceCache 的性能
+// BenchmarkEnforceCache_CleanupHighCardinality 高基数缓存失效性能
+// 填充大量不同 key 的缓存条目后触发失效，验证代际轮转 O(1) 失效的性能
 func BenchmarkEnforceCache_CleanupHighCardinality(b *testing.B) {
 	e := newMemoryEnforcerB(b, rbacModelPath)
 
@@ -376,9 +380,8 @@ func BenchmarkEnforceCache_CleanupHighCardinality(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		// 每次策略变更后清理
+		// 每次策略变更后整体失效（版本号递增 + 两代重建）
 		e.invalidateEnforceCache()
-		e.cleanupEnforceCache(e.enforceCacheVersion.Load())
 	}
 }
 

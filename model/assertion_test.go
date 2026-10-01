@@ -83,9 +83,9 @@ func TestAssertion_RebuildPolicyMap(t *testing.T) {
 	a.Policies = append(a.Policies, []string{"eve", "data3", "write"})
 	a.RebuildPolicyMap()
 
-	assert.Equal(t, 0, a.PolicyMap["alice,data1,read"])
-	assert.Equal(t, 1, a.PolicyMap["bob,data2,write"])
-	assert.Equal(t, 2, a.PolicyMap["eve,data3,write"])
+	assert.Contains(t, a.PolicyMap, "alice,data1,read")
+	assert.Contains(t, a.PolicyMap, "bob,data2,write")
+	assert.Contains(t, a.PolicyMap, "eve,data3,write")
 }
 
 func TestAssertion_RebuildPolicyMap_NilPolicyMap(t *testing.T) {
@@ -97,5 +97,5 @@ func TestAssertion_RebuildPolicyMap_NilPolicyMap(t *testing.T) {
 	}
 	a.RebuildPolicyMap()
 	assert.NotNil(t, a.PolicyMap)
-	assert.Equal(t, 0, a.PolicyMap["alice,data1,read"])
+	assert.Contains(t, a.PolicyMap, "alice,data1,read")
 }

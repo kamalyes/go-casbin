@@ -75,6 +75,12 @@ var funcArgsPool = syncx.NewPool(func() []interface{} {
 	return make([]interface{}, 0, 4)
 })
 
+// varsMapPool 复用变量映射表，减少每次匹配的 map 分配
+// eval 求值全程只读 vars（kindEval 展开的子表达式亦只读），clear 后归还即可安全复用
+var varsMapPool = syncx.NewPool(func() map[string]interface{} {
+	return make(map[string]interface{}, 8)
+})
+
 // Match 执行匹配，返回是否匹配以及匹配策略的效果列表
 // 核心匹配流程：
 //   - 如果有策略，遍历每条策略评估 matcher 表达式
@@ -97,9 +103,11 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 	effectIdx := computeEffectIndex(mc.Assertion)
 
 	if len(mc.Policies) == 0 && len(mc.ExtraPolicies) == 0 {
-		vars := me.buildVariableMap(mc.Request, nil, nil)
+		vars := me.acquireVars(mc.Request, nil, nil)
 		compiled := me.getCompiledExpr(matcherExpr)
-		if compiled.eval(me, vars, mc.RoleMgr) {
+		result := compiled.eval(me, vars, mc.RoleMgr)
+		releaseVars(vars)
+		if result {
 			return true, []string{"allow"}, nil
 		}
 		return false, nil, nil
@@ -109,12 +117,13 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 		return me.matchWithExtraPolicies(mc, matcherExpr, matchedEffects)
 	}
 
-	// vars map 复用：无 eval() 场景，预构建含 request 字段的复用 map
+	// vars map 池化复用：无 eval() 场景，预构建含 request 字段的复用 map
 	// 每条策略只更新 p.* 字段（r.* 不变），省去 N 次 map 分配 + request 拷贝
 	// 编译表达式 eval 只读 vars 不写，复用安全；有 eval() 时必须每条策略独立 vars（p.sub_rule 值不同）
 	var reusableVars map[string]interface{}
 	if !hasEval {
-		reusableVars = me.buildVariableMap(mc.Request, nil, mc.Assertion)
+		reusableVars = me.acquireVars(mc.Request, nil, mc.Assertion)
+		defer releaseVars(reusableVars)
 	}
 
 	compiled := me.getCompiledExpr(matcherExpr)
@@ -122,8 +131,8 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 	for _, p := range mc.Policies {
 		var vars map[string]interface{}
 		if hasEval {
-			// 有 eval()：每条策略的 p.sub_rule 值不同，必须独立 vars
-			vars = me.buildVariableMap(mc.Request, p, mc.Assertion)
+			// 有 eval()：每条策略的 p.sub_rule 值不同，必须独立 vars，用完即归还
+			vars = me.acquireVars(mc.Request, p, mc.Assertion)
 		} else {
 			// 无 eval()：复用 vars，只更新 p.* 字段（覆盖旧值）
 			// 同一 ptype 的策略字段数固定（模型定义），不会残留多余字段
@@ -137,7 +146,11 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 			}
 		}
 
-		if compiled.eval(me, vars, mc.RoleMgr) {
+		matched := compiled.eval(me, vars, mc.RoleMgr)
+		if hasEval {
+			releaseVars(vars)
+		}
+		if matched {
 			eft := extractEffectFast(p, effectIdx)
 
 			// 短路优化：对于 some(where(p.eft==allow)) 模式，
@@ -232,19 +245,22 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 	effectIdx := computeEffectIndex(assertion)
 
 	if len(policies) == 0 {
-		vars := me.buildVariableMap(mc.Request, nil, nil)
+		vars := me.acquireVars(mc.Request, nil, nil)
 		compiled := me.getCompiledExpr(expr)
-		if compiled.eval(me, vars, mc.RoleMgr) {
+		result := compiled.eval(me, vars, mc.RoleMgr)
+		releaseVars(vars)
+		if result {
 			return true, []string{"allow"}, nil
 		}
 		return false, nil, nil
 	}
 
-	// vars map 复用：无 eval() 场景，预构建含 request 字段的复用 map
+	// vars map 池化复用：无 eval() 场景，预构建含 request 字段的复用 map
 	// 每条策略只更新 p.* 字段，省去 N 次 map 分配 + request 拷贝
 	var reusableVars map[string]interface{}
 	if !hasEval {
-		reusableVars = me.buildVariableMap(mc.Request, nil, assertion)
+		reusableVars = me.acquireVars(mc.Request, nil, assertion)
+		defer releaseVars(reusableVars)
 	}
 
 	compiled := me.getCompiledExpr(expr)
@@ -252,7 +268,7 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 	for _, p := range policies {
 		var vars map[string]interface{}
 		if hasEval {
-			vars = me.buildVariableMap(mc.Request, p, assertion)
+			vars = me.acquireVars(mc.Request, p, assertion)
 		} else {
 			vars = reusableVars
 			if assertion != nil {
@@ -264,7 +280,11 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 			}
 		}
 
-		if compiled.eval(me, vars, mc.RoleMgr) {
+		matched := compiled.eval(me, vars, mc.RoleMgr)
+		if hasEval {
+			releaseVars(vars)
+		}
+		if matched {
 			eft := extractEffectFast(p, effectIdx)
 			matchedEffects = append(matchedEffects, eft)
 
@@ -544,16 +564,13 @@ func (me *MatcherEngine) evaluateRoleFunctionWithDomain(name1, name2, domain str
 	return roleMgr.HasLink(name1, name2, domain)
 }
 
-// buildVariableMap 构建变量映射表
-// 将请求参数（r 段）和策略行（p 段）合并为一个统一的变量表
+// acquireVars 从池获取变量表，clear 残留后填充请求参数（r 段）和策略行（p 段）
 // 例如：{r.sub: "alice", r.obj: "data1", p.sub: "admin", p.obj: "data1"}
-func (me *MatcherEngine) buildVariableMap(request map[string]interface{}, policyLine []string, assertion *model.Assertion) map[string]interface{} {
-	// 预分配容量：请求数 + 策略字段数
-	capacity := len(request)
-	if assertion != nil && len(policyLine) > 0 {
-		capacity += len(assertion.Tokens)
-	}
-	vars := make(map[string]interface{}, capacity)
+// 替代每次 make 新 map：miss 路径每请求一次 map 分配是显著热点
+// 池中 map 已增长到稳态容量，clear 仅重置长度不缩容，稳态零分配
+func (me *MatcherEngine) acquireVars(request map[string]interface{}, policyLine []string, assertion *model.Assertion) map[string]interface{} {
+	vars := varsMapPool.Get()
+	clear(vars)
 
 	for key, val := range request {
 		vars[key] = val
@@ -568,6 +585,16 @@ func (me *MatcherEngine) buildVariableMap(request map[string]interface{}, policy
 	}
 
 	return vars
+}
+
+// releaseVars 清空并归还变量表（nil 安全）
+// Put 前 clear 斩断值引用，避免请求中的大对象因池滞留而延迟回收
+func releaseVars(vars map[string]interface{}) {
+	if vars == nil {
+		return
+	}
+	clear(vars)
+	varsMapPool.Put(vars)
 }
 
 // parseFunctionCall 解析函数调用表达式

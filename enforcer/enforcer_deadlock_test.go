@@ -136,13 +136,13 @@ func TestHandlePolicyChange_IncrementalEvent(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	versionBefore := e.enforceCacheVersion.Load()
+	versionBefore := e.enforceCache.Version()
 
 	// 触发增量事件
 	e.handlePolicyChange(policy.NewChangeEvent(policy.EventTypePolicyAdded, "p", "remote"))
 
 	// 增量事件走 reloadPolicyForRemoteChange，不清空 enforceCache
-	versionAfter := e.enforceCacheVersion.Load()
+	versionAfter := e.enforceCache.Version()
 	assert.Equal(t, versionBefore, versionAfter, "incremental event should not invalidate enforceCache")
 }
 
@@ -159,13 +159,13 @@ func TestHandlePolicyChange_FullEvent(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	versionBefore := e.enforceCacheVersion.Load()
+	versionBefore := e.enforceCache.Version()
 
 	// 触发全量事件
 	e.handlePolicyChange(policy.NewChangeEvent(policy.EventTypePolicyReload, "", "remote"))
 
 	// 全量事件走 ReloadPolicy，调用 invalidateExtraPoliciesCache → 版本号递增
-	versionAfter := e.enforceCacheVersion.Load()
+	versionAfter := e.enforceCache.Version()
 	assert.Greater(t, versionAfter, versionBefore, "full event should invalidate enforceCache")
 }
 
@@ -196,10 +196,10 @@ func TestExecuteInTransaction_FnErrorFix(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// ==================== enforceCache 清理测试 ====================
+// ==================== enforceCache 代际轮转测试 ====================
 
-// TestEnforceCache_CleanupOrphanedEntries 验证 cleanupEnforceCache 清理过期/版本号不匹配的条目
-func TestEnforceCache_CleanupOrphanedEntries(t *testing.T) {
+// TestEnforceCache_InvalidateOrphanedEntries 验证策略变更后旧版本条目全部失效
+func TestEnforceCache_InvalidateOrphanedEntries(t *testing.T) {
 	e := newMemoryEnforcer(t, rbacModelPath)
 
 	err := e.AddPolicy("alice", "data1", "read")
@@ -208,32 +208,45 @@ func TestEnforceCache_CleanupOrphanedEntries(t *testing.T) {
 	// 填充缓存
 	_, _ = e.Enforce("alice", "data1", "read")
 
-	// 缓存应有 1 个条目
-	count := 0
-	e.enforceCache.Range(func(key string, entry enforceCacheEntry) bool {
-		count++
-		return true
-	})
-	assert.Equal(t, 1, count)
+	// 缓存应命中
+	_, hit := e.enforceCache.Load("alice|data1|read|")
+	assert.True(t, hit)
 
-	// 策略变更递增版本号
+	// 策略变更递增版本号并重建两代
 	e.invalidateEnforceCache()
-	currentVersion := e.enforceCacheVersion.Load()
 
-	// 清理旧版本条目
-	e.cleanupEnforceCache(currentVersion)
-
-	// 旧版本条目应被清理
-	count = 0
-	e.enforceCache.Range(func(key string, entry enforceCacheEntry) bool {
-		count++
-		return true
-	})
-	assert.Equal(t, 0, count, "orphaned cache entries should be cleaned up")
+	// 旧版本条目应立即失效
+	_, hit = e.enforceCache.Load("alice|data1|read|")
+	assert.False(t, hit, "orphaned cache entries should be invalidated")
 }
 
-// TestEnforceCache_ConcurrentCleanup 并发 Enforce + cleanupEnforceCache，验证无 panic
-func TestEnforceCache_ConcurrentCleanup(t *testing.T) {
+// TestEnforceCache_GenerationalRotation 验证代际轮转行为
+// 到期后旧代降级为 prev 仍可命中，再次轮转后旧条目彻底消失
+func TestEnforceCache_GenerationalRotation(t *testing.T) {
+	e := newMemoryEnforcer(t, rbacModelPath)
+
+	err := e.AddPolicy("alice", "data1", "read")
+	require.NoError(t, err)
+
+	// 填充 current 代
+	_, _ = e.Enforce("alice", "data1", "read")
+	require.NotNil(t, e.enforceCache.current.Load())
+
+	// 强制 current 代过期后手动轮转：旧 current 降级为 prev，条目在 prev 仍可命中
+	e.enforceCache.current.Load().expiresAt = time.Now().Add(-time.Second).UnixNano()
+	e.enforceCache.rotateLocked(time.Now())
+	_, hit := e.enforceCache.Load("alice|data1|read|")
+	assert.True(t, hit, "entries demoted to prev gen should still be readable")
+
+	// 二次轮转：原 prev 整体废弃，条目彻底消失
+	e.enforceCache.current.Load().expiresAt = time.Now().Add(-time.Second).UnixNano()
+	e.enforceCache.rotateLocked(time.Now())
+	_, hit = e.enforceCache.Load("alice|data1|read|")
+	assert.False(t, hit, "entries dropped with old prev gen should be gone")
+}
+
+// TestEnforceCache_ConcurrentRotate 并发 Enforce + 轮转/失效，验证无 panic 无 race
+func TestEnforceCache_ConcurrentRotate(t *testing.T) {
 	e := newMemoryEnforcer(t, rbacModelPath)
 
 	err := e.AddPolicy("alice", "data1", "read")
@@ -242,7 +255,7 @@ func TestEnforceCache_ConcurrentCleanup(t *testing.T) {
 	var wg sync.WaitGroup
 	const iterations = 100
 
-	// 并发 Enforce（填充缓存 + 可能触发异步 cleanup）
+	// 并发 Enforce（填充缓存 + 触发轮转检查）
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -251,12 +264,13 @@ func TestEnforceCache_ConcurrentCleanup(t *testing.T) {
 		}
 	}()
 
-	// 并发手动清理
+	// 并发轮转与失效
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iterations; i++ {
-			e.cleanupEnforceCache(e.enforceCacheVersion.Load())
+			e.enforceCache.rotateLocked(time.Now().Add(2 * enforceCacheTTL))
+			e.invalidateEnforceCache()
 		}
 	}()
 

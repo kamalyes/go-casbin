@@ -301,6 +301,7 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 
 	// in-place compaction：保留不匹配的策略，仅深拷贝匹配的策略用于回滚
 	// 替代之前的 clear-all + re-add，避免 N 次 AddPolicy 的 strings.Join 分配
+	// 索引与行位置解耦后，仅需删除被移除策略的 key，无需全量重建
 	var removed [][]string
 	writeIdx := 0
 	for _, policy := range assertion.Policies {
@@ -313,6 +314,7 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 		}
 		if match {
 			removed = append(removed, append([]string(nil), policy...))
+			delete(assertion.PolicyMap, strings.Join(policy, ","))
 		} else {
 			assertion.Policies[writeIdx] = policy
 			writeIdx++
@@ -324,21 +326,24 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 	}
 
 	assertion.Policies = assertion.Policies[:writeIdx]
-	assertion.RebuildPolicyMap()
 
 	if p.autoSave && p.adapter != nil {
 		if pa, ok := p.adapter.(PTypeUpdatableAdapter); ok {
 			if err := pa.UpdateFilteredPoliciesByPType(ptype, nil, fieldIndex, fieldValues...); err != nil {
 				// 回滚内存：恢复被删除的策略
 				assertion.Policies = append(assertion.Policies, removed...)
-				assertion.RebuildPolicyMap()
+				for _, rule := range removed {
+					assertion.PolicyMap[strings.Join(rule, ",")] = struct{}{}
+				}
 				return errors.WrapError("RemoveFilteredPolicy", err)
 			}
 		} else if ua, ok := p.adapter.(UpdatableAdapter); ok {
 			if err := ua.UpdateFilteredPolicies(nil, fieldIndex, fieldValues...); err != nil {
 				// 回滚内存：恢复被删除的策略
 				assertion.Policies = append(assertion.Policies, removed...)
-				assertion.RebuildPolicyMap()
+				for _, rule := range removed {
+					assertion.PolicyMap[strings.Join(rule, ",")] = struct{}{}
+				}
 				return errors.WrapError("RemoveFilteredPolicy", err)
 			}
 		} else {
@@ -376,6 +381,7 @@ func (p *Policy) UpdateFilteredPolicies(sec, ptype string, newPolicies [][]strin
 
 	// in-place compaction：保留不匹配的策略，仅深拷贝匹配的策略用于回滚
 	// 替代之前的深拷贝全部策略 + clear-all + re-add，避免 O(N) 次 AddPolicy 分配
+	// 索引与行位置解耦后，仅需删除被移除策略的 key，无需全量重建
 	var oldMatched [][]string
 	writeIdx := 0
 	for _, rule := range assertion.Policies {
@@ -388,6 +394,7 @@ func (p *Policy) UpdateFilteredPolicies(sec, ptype string, newPolicies [][]strin
 		}
 		if match {
 			oldMatched = append(oldMatched, append([]string(nil), rule...))
+			delete(assertion.PolicyMap, strings.Join(rule, ","))
 		} else {
 			assertion.Policies[writeIdx] = rule
 			writeIdx++
@@ -395,13 +402,15 @@ func (p *Policy) UpdateFilteredPolicies(sec, ptype string, newPolicies [][]strin
 	}
 	compactedLen := writeIdx
 	assertion.Policies = assertion.Policies[:compactedLen]
-	assertion.RebuildPolicyMap()
 
 	// 追加新策略
+	// newlyAdded 记录本次真正写入的规则，回滚时精确删除其 key，避免误删原有策略索引
+	var newlyAdded [][]string
 	for _, rule := range newPolicies {
 		if !assertion.HasPolicy(rule) {
 			assertion.Policies = append(assertion.Policies, rule)
-			assertion.PolicyMap[strings.Join(rule, ",")] = len(assertion.Policies) - 1
+			assertion.PolicyMap[strings.Join(rule, ",")] = struct{}{}
+			newlyAdded = append(newlyAdded, rule)
 		}
 	}
 
@@ -423,7 +432,12 @@ func (p *Policy) UpdateFilteredPolicies(sec, ptype string, newPolicies [][]strin
 			// 回滚：截断新增策略，恢复被删除的策略
 			assertion.Policies = assertion.Policies[:compactedLen]
 			assertion.Policies = append(assertion.Policies, oldMatched...)
-			assertion.RebuildPolicyMap()
+			for _, rule := range newlyAdded {
+				delete(assertion.PolicyMap, strings.Join(rule, ","))
+			}
+			for _, rule := range oldMatched {
+				assertion.PolicyMap[strings.Join(rule, ",")] = struct{}{}
+			}
 			return errors.WrapError("UpdateFilteredPolicies", err)
 		}
 	}

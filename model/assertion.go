@@ -30,14 +30,14 @@ type Assertion struct {
 	Value     string
 	Tokens    []string
 	Policies  [][]string
-	PolicyMap map[string]int
+	PolicyMap map[string]struct{} // 策略存在性索引（key 为逗号拼接的规则值），与行位置解耦，删除无需重建
 }
 
 func NewAssertion(key, value string) *Assertion {
 	a := &Assertion{
 		Key:       key,
 		Value:     strings.TrimSpace(value),
-		PolicyMap: make(map[string]int),
+		PolicyMap: make(map[string]struct{}),
 	}
 	a.buildTokens()
 	return a
@@ -58,24 +58,33 @@ func (a *Assertion) buildTokens() {
 	}
 }
 
+// AddPolicy 添加策略规则
+// 已存在相同规则时幂等跳过
 func (a *Assertion) AddPolicy(policy []string) {
 	key := strings.Join(policy, ",")
 	if _, exists := a.PolicyMap[key]; exists {
 		return
 	}
 	a.Policies = append(a.Policies, policy)
-	a.PolicyMap[key] = len(a.Policies) - 1
+	a.PolicyMap[key] = struct{}{}
 }
 
+// RemovePolicy 删除策略规则
+// 性能优化：索引与行位置解耦后，删除仅需移除 key + 尾部交换压缩，无需全量重建索引
+// 注：swap-delete 不保持行顺序（策略匹配顺序无关，无语义影响）
 func (a *Assertion) RemovePolicy(policy []string) bool {
 	key := strings.Join(policy, ",")
-	idx, exists := a.PolicyMap[key]
-	if !exists {
+	if _, exists := a.PolicyMap[key]; !exists {
 		return false
 	}
-	a.Policies = append(a.Policies[:idx], a.Policies[idx+1:]...)
+	for i, p := range a.Policies {
+		if strings.Join(p, ",") == key {
+			a.Policies[i] = a.Policies[len(a.Policies)-1]
+			a.Policies = a.Policies[:len(a.Policies)-1]
+			break
+		}
+	}
 	delete(a.PolicyMap, key)
-	a.RebuildPolicyMap()
 	return true
 }
 
@@ -87,21 +96,21 @@ func (a *Assertion) HasPolicy(policy []string) bool {
 
 func (a *Assertion) ClearPolicies() {
 	a.Policies = nil
-	a.PolicyMap = make(map[string]int)
+	a.PolicyMap = make(map[string]struct{})
 }
 
 // RebuildPolicyMap 重建 PolicyMap（用于批量修改 Policies 后一次性重建索引）
-// 导出方法：供 policy 层在 in-place 批量增删后调用，替代逐条 AddPolicy 的 N 次 strings.Join
+// 导出方法：供 policy 层在全量重载后调用，替代逐条 AddPolicy 的 N 次 strings.Join
 func (a *Assertion) RebuildPolicyMap() {
 	if a.PolicyMap == nil {
-		a.PolicyMap = make(map[string]int, len(a.Policies))
+		a.PolicyMap = make(map[string]struct{}, len(a.Policies))
 	} else {
 		for k := range a.PolicyMap {
 			delete(a.PolicyMap, k)
 		}
 	}
-	for i, p := range a.Policies {
-		a.PolicyMap[strings.Join(p, ",")] = i
+	for _, p := range a.Policies {
+		a.PolicyMap[strings.Join(p, ",")] = struct{}{}
 	}
 }
 

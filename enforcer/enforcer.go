@@ -16,8 +16,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/kamalyes/go-casbin/errors"
 	"github.com/kamalyes/go-casbin/model"
@@ -36,14 +34,6 @@ const (
 	StateDisabled = "disabled" // 禁用状态：所有 Enforce 调用返回错误
 	StateError    = "error"    // 错误状态：策略加载失败等异常
 )
-
-// enforceCacheTTL Enforce 结果缓存存活时长
-// 策略变更时主动失效；分布式场景下各实例独立缓存，通过短 TTL 容忍秒级不一致
-const enforceCacheTTL = 30 * time.Second
-
-// enforceCacheCleanupEvery 每隔多少次 Store 触发一次异步清理过期条目
-// 避免高基数场景下 enforceCache 无限增长导致 OOM
-const enforceCacheCleanupEvery = 1000
 
 // 策略主体常量
 const (
@@ -111,18 +101,8 @@ type Enforcer struct {
 
 	// Enforce 结果缓存：缓存 (sub,obj,act,...) → allow/deny，命中后跳过 RLock+matcher，O(1) 返回
 	// 仅缓存全 string 的 rvals（ABAC 结构体不缓存）；策略变更时主动失效
-	// 使用版本号机制实现 O(1) 失效：策略变更时递增版本号，旧条目在 Load 时自然忽略
-	// 定期异步清理过期条目，防止高基数场景下内存无限增长
-	enforceCache        syncx.Map[string, enforceCacheEntry]
-	enforceCacheVersion atomic.Uint64 // 策略变更时递增，使所有旧版本号条目失效
-	enforceCacheStores  atomic.Uint64 // Store 调用计数，用于触发定期清理
-}
-
-// enforceCacheEntry Enforce 结果缓存条目
-type enforceCacheEntry struct {
-	result    bool
-	expiresAt time.Time
-	version   uint64 // 创建时的 enforceCacheVersion，版本号不匹配时视为失效
+	// 代际轮转实现：到期整代废弃 O(1) 回收，无需后台清理 goroutine 和全表扫描
+	enforceCache *generationalEnforceCache
 }
 
 // NewEnforcer 创建核心执行器
@@ -162,6 +142,7 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		publicPolicies:     o.publicPolicies,
 		authSkipPolicies:   o.authSkipPolicies,
 		normalizeHost:      o.normalizeHost,
+		enforceCache:       newGenerationalEnforceCache(),
 	}
 
 	e.registerBuiltinFunctions()
@@ -310,22 +291,13 @@ func (e *Enforcer) EnforceContext(ctx context.Context, rvals ...interface{}) (bo
 	// 仅缓存全 string 的 rvals（ABAC 结构体不缓存）
 	// 版本号不匹配时视为失效（策略已变更），不返回旧结果
 	if cacheKey, cacheable := buildEnforceCacheKey(rvals); cacheable {
-		currentVersion := e.enforceCacheVersion.Load()
-		if entry, hit := e.enforceCache.Load(cacheKey); hit && entry.version == currentVersion && time.Now().Before(entry.expiresAt) {
+		if entry, hit := e.enforceCache.Load(cacheKey); hit {
 			return entry.result, nil
 		}
-		// 缓存 miss 或过期或版本号不匹配，走 enforceCore 后回填
+		// 缓存 miss，走 enforceCore 后回填（TTL 与版本号由缓存内部管理）
 		result, err := e.enforceCore(ctx, rvals...)
 		if err == nil {
-			e.enforceCache.Store(cacheKey, enforceCacheEntry{
-				result:    result,
-				expiresAt: time.Now().Add(enforceCacheTTL),
-				version:   currentVersion,
-			})
-			// 定期触发异步清理过期条目，防止高基数场景下内存无限增长
-			if e.enforceCacheStores.Add(1)%enforceCacheCleanupEvery == 0 {
-				go e.cleanupEnforceCache(currentVersion)
-			}
+			e.enforceCache.Store(cacheKey, result)
 		}
 		return result, err
 	}
@@ -425,22 +397,9 @@ func buildEnforceCacheKey(rvals []interface{}) (string, bool) {
 }
 
 // invalidateEnforceCache 使所有 Enforce 结果缓存失效
-// 使用版本号机制实现 O(1) 失效：递增版本号后，旧条目在 Load 时因版本号不匹配被自然忽略
-// 过期条目由 cleanupEnforceCache 定期异步清理，不影响热路径性能
+// 代际缓存内部通过版本号递增 + 两代重建实现 O(1) 失效，旧条目随 GC 回收
 func (e *Enforcer) invalidateEnforceCache() {
-	e.enforceCacheVersion.Add(1)
-}
-
-// cleanupEnforceCache 清理过期或版本号不匹配的缓存条目
-// 在后台 goroutine 中执行，不阻塞 Enforce 热路径
-func (e *Enforcer) cleanupEnforceCache(currentVersion uint64) {
-	now := time.Now()
-	e.enforceCache.Range(func(key string, entry enforceCacheEntry) bool {
-		if entry.version != currentVersion || now.After(entry.expiresAt) {
-			e.enforceCache.Delete(key)
-		}
-		return true
-	})
+	e.enforceCache.Invalidate()
 }
 
 // EnforceWithMatcher 使用自定义匹配表达式执行权限校验
@@ -2504,19 +2463,37 @@ func (e *Enforcer) releaseRequest(request map[string]interface{}) {
 }
 
 // normalizeRequestValue 规范请求参数值，根据 token 类型进行转换
+// 性能优化：值未发生变化时直接返回原 interface{}，避免 string→interface{} 重新装箱分配
+// 仅在 TrimSpace/路径规范化/动作规范化真正改变值时才分配新值
 func normalizeRequestValue(token string, value interface{}) interface{} {
 	s, ok := value.(string)
 	if !ok {
 		return value
 	}
-	s = strings.TrimSpace(s)
+	trimmed := strings.TrimSpace(s)
+	if trimmed == s {
+		switch {
+		case strings.HasSuffix(token, ".obj"):
+			if normalized := normalizeKeyMatchPath(s, false); normalized != s {
+				return normalized
+			}
+			return value // 路径规范化未改变值，返回原 interface 零装箱
+		case strings.HasSuffix(token, ".act"):
+			if normalized := normalizeHTTPAction(s); normalized != s {
+				return normalized
+			}
+			return value
+		default:
+			return value // 无需规范化，返回原 interface 零装箱
+		}
+	}
 	switch {
 	case strings.HasSuffix(token, ".obj"):
-		return normalizeKeyMatchPath(s, false)
+		return normalizeKeyMatchPath(trimmed, false)
 	case strings.HasSuffix(token, ".act"):
-		return normalizeHTTPAction(s)
+		return normalizeHTTPAction(trimmed)
 	default:
-		return s
+		return trimmed
 	}
 }
 

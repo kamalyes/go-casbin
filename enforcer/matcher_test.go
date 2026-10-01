@@ -389,9 +389,9 @@ func TestMatcherEngine_ExtractEffect(t *testing.T) {
 	assert.Equal(t, "allow", me.extractEffect([]string{"alice", "data1", "read"}, nil))
 }
 
-// ==================== buildVariableMap 测试 ====================
+// ==================== acquireVars/releaseVars 测试 ====================
 
-func TestMatcherEngine_BuildVariableMap(t *testing.T) {
+func TestMatcherEngine_AcquireVars(t *testing.T) {
 	me := newTestMatcherEngine()
 
 	request := map[string]interface{}{
@@ -399,7 +399,7 @@ func TestMatcherEngine_BuildVariableMap(t *testing.T) {
 	}
 
 	// 无策略行
-	vars := me.buildVariableMap(request, nil, nil)
+	vars := me.acquireVars(request, nil, nil)
 	assert.Equal(t, "alice", vars["r.sub"])
 	assert.Equal(t, "data1", vars["r.obj"])
 
@@ -407,10 +407,18 @@ func TestMatcherEngine_BuildVariableMap(t *testing.T) {
 	assertion := &model.Assertion{
 		Tokens: []string{"p.sub", "p.obj", "p.act"},
 	}
-	vars = me.buildVariableMap(request, []string{"admin", "data1", "read"}, assertion)
+	vars = me.acquireVars(request, []string{"admin", "data1", "read"}, assertion)
 	assert.Equal(t, "alice", vars["r.sub"])
 	assert.Equal(t, "admin", vars["p.sub"])
 	assert.Equal(t, "data1", vars["p.obj"])
+
+	// 池化回环：归还后重新获取应为清空状态，无残留键
+	releaseVars(vars)
+	reused := me.acquireVars(map[string]interface{}{"r.sub": "bob"}, nil, nil)
+	assert.Equal(t, "bob", reused["r.sub"])
+	assert.NotContains(t, reused, "p.sub")
+	assert.NotContains(t, reused, "r.obj")
+	releaseVars(reused)
 }
 
 // ==================== resolveValue 测试 ====================

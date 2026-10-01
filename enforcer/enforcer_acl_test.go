@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/kamalyes/go-casbin/policy"
+	"github.com/kamalyes/go-logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -63,11 +64,13 @@ func newMemoryEnforcer(t *testing.T, modelPath string) *Enforcer {
 
 // newMemoryEnforcerB 用于 benchmark 的 enforcer 创建辅助函数
 // 使用 testing.TB 接口，兼容 *testing.T 和 *testing.B
+// 使用空日志实现，避免日志输出污染基准数据并干扰耗时测量
 func newMemoryEnforcerB(tb testing.TB, modelPath string) *Enforcer {
 	tb.Helper()
 	e, err := NewEnforcer(
 		WithModelPath(modelPath),
 		WithAutoSave(true),
+		WithLogger(logger.NewEmptyLogger()),
 	)
 	if err != nil {
 		tb.Fatal(err)
