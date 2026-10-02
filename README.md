@@ -43,6 +43,100 @@ go-casbin 是一个企业级的权限管理系统，基于 Go 语言开发，深
 
 > 一句话：**不是重造 PERM 模型，而是把官方「一个授权库」升级为「一个平台级权限能力」——分片隔离、事务一致、context 治理、分布式可靠同步、可观测性全部内建**
 
+## 🏗️ 架构设计
+
+### 架构层次图
+
+```mermaid
+flowchart TB
+    %% ==================== 业务接入层 ====================
+    subgraph "业务接入层"
+        ACSvc["ac 服务<br/>权限校验流量入口"]
+        BizApp["业务服务<br/>嵌入式 SDK 集成"]
+        AdminCLI["管理面 / CLI<br/>策略变更入口"]
+    end
+
+    %% ==================== 核心引擎 · Enforce 读路径 ====================
+    subgraph "核心引擎 · Enforce 读路径（全内存 0 DB RTT）"
+
+        subgraph "入口门面"
+            Enforcer["Enforcer<br/>熔断 + 重试 + 事务上下文"]
+        end
+
+        subgraph "结果缓存 · 代际轮转"
+            GenCache["代际轮转缓存<br/>current / prev 双代<br/>到期整体废弃 O(1)<br/>命中 ~125ns 返回"]
+        end
+
+        subgraph "内存匹配域"
+            Normalize["请求规范化<br/>零装箱 TrimSpace<br/>路径 / HTTP 动作归一"]
+            Matcher["匹配引擎 Matcher<br/>AST 编译缓存 + 短路求值<br/>vars map 池化"]
+            RoleLink["角色管理 RoleManager<br/>HasLink 缓存<br/>继承 DFS + 环检测"]
+        end
+
+        subgraph "内存模型域"
+            MemModel["内存策略模型<br/>PolicyMap 存在性索引<br/>O(1) 去重 / 增量维护"]
+            RoleGraph["角色关系图<br/>内存 links + 三级域隔离"]
+        end
+    end
+
+    %% ==================== 策略管理路径 · 写路径 ====================
+    subgraph "策略管理路径 · 写路径"
+        PolicyMgr["策略管理 Policy<br/>增删改 / 批量 / 过滤更新<br/>事务 + 精确回滚"]
+        DomainSync["域身份绑定<br/>Tenant ↔ Host 同步"]
+        CacheInvalid["缓存失效联动<br/>版本递增 + 两代重建<br/>无逐条扫描"]
+    end
+
+    %% ==================== 存储层 ====================
+    subgraph "存储层"
+        Adapter["适配器 Adapter<br/>能力接口族 Batch / Filtered / Updatable / Transactional / Context<br/>内置 Memory / File · 生态 GORM / NATS<br/>autoSave 自动落库"]
+        Database[("MySQL / PostgreSQL<br/>仅启动加载 + 变更写入")]
+    end
+
+    %% ==================== 支撑与可观测 ====================
+    subgraph "支撑与可观测"
+        Toolbox["go-toolbox<br/>syncx.Map / Pool / 熔断 / 重试"]
+        Logger["go-logger<br/>结构化 KV 日志"]
+        Monitor["监控指标<br/>enforce_total / 延迟分布<br/>存储健康检查"]
+    end
+
+    %% ==================== 读路径 ====================
+    ACSvc -->|"Enforce(sub, obj, act)"| Enforcer
+    BizApp -->|"Enforce(...)"| Enforcer
+    Enforcer --> GenCache
+    GenCache -->|"命中 · 直接返回"| ACSvc
+    GenCache -->|"miss"| Normalize
+    Normalize --> Matcher
+    Matcher --> MemModel
+    Matcher --> RoleLink
+    RoleLink --> RoleGraph
+    Matcher -->|"结果写回"| GenCache
+
+    %% ==================== 写路径 ====================
+    AdminCLI --> PolicyMgr
+    DomainSync --> PolicyMgr
+    PolicyMgr --> Adapter
+    Adapter --> Database
+    PolicyMgr --> CacheInvalid
+    CacheInvalid -.->|"下次 Enforce 重新匹配"| GenCache
+
+    %% ==================== 启动加载 ====================
+    Database -.->|"启动 LoadPolicy 全量加载"| MemModel
+
+    %% ==================== 支撑 ====================
+    Toolbox -.-> Matcher
+    Toolbox -.-> GenCache
+    Logger -.-> Enforcer
+    Monitor -.-> Enforcer
+```
+
+### 核心组件
+
+- **执行器 (Enforcer)**：系统核心，负责权限检查的统一入口，集成熔断器和重试机制
+- **匹配引擎 (Matcher)**：基于 go-toolbox/matcher 的高性能规则匹配引擎，支持复杂表达式解析
+- **模型管理 (Model)**：处理权限模型的加载、验证和解析，支持多种权限模型
+- **策略管理 (Policy)**：管理权限策略的存储、加载和更新，支持多种存储后端
+- **角色管理 (Role)**：处理角色层级关系，支持角色继承和多租户隔离
+
 ## 📖 权限模型对比：ACL vs RBAC vs ABAC vs PBAC
 
 > 理解不同权限模型的本质区别，是正确选择和使用 go-casbin 的前提
@@ -156,82 +250,6 @@ p, role:admin-uuid, tenant123::platform-uuid, /api/*, *
 g, user-uuid, role:admin-uuid, tenant123::platform-uuid
 ```
 
-## 🏗️ 架构设计
-
-### 架构层次图
-
-```mermaid
-graph TB
-    subgraph "应用层"
-        App[业务应用 API/Service]
-        CLI[命令行工具 Admin]
-    end
-
-    subgraph "核心层"
-        Enforcer[执行器 Enforcer<br/>权限检查入口<br/>breaker + retry]
-        Matcher[匹配引擎 Matcher<br/>规则匹配与求值<br/>支持复杂表达式]
-        Model[模型管理 Model<br/>模型加载与解析<br/>完整性验证]
-        Policy[策略管理 Policy<br/>策略存储与更新<br/>缓存 + 监听器]
-        Role[角色管理 Role<br/>角色层级与继承<br/>循环检测]
-    end
-
-    subgraph "存储层"
-        Adapter[适配器接口 Adapter]
-        Memory[内存存储<br/>并发安全 Map]
-        File[文件存储<br/>CSV/JSON 格式]
-        DB[数据库存储<br/>MySQL/PostgreSQL]
-        Redis[Redis缓存<br/>分布式同步]
-    end
-
-    subgraph "工具与监控层"
-        Toolbox[go-toolbox<br/>并发/错误/重试/ID生成]
-        Logger[go-logger<br/>结构化日志/分布式追踪]
-        Metrics[指标收集<br/>enforce_total/success]
-        Health[健康检查<br/>存储连接状态]
-    end
-
-    App --> Enforcer
-    CLI --> Enforcer
-    Enforcer --> Matcher
-    Enforcer --> Model
-    Enforcer --> Policy
-    Enforcer --> Role
-    Policy --> Adapter
-    Adapter --> Memory
-    Adapter --> File
-    Adapter --> DB
-    Adapter --> Redis
-    Enforcer --> Toolbox
-    Enforcer --> Logger
-    Enforcer --> Metrics
-    Enforcer --> Health
-
-    classDef appStyle fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
-    classDef coreStyle fill:#fff3e0,stroke:#f57c00,stroke-width:2px
-    classDef storageStyle fill:#e0f2f1,stroke:#00796b,stroke-width:2px
-    classDef toolStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
-
-    class App,CLI appStyle
-    class Enforcer,Matcher,Model,Policy,Role coreStyle
-    class Adapter,Memory,File,DB,Redis storageStyle
-    class Toolbox,Logger,Metrics,Health toolStyle
-```
-
-### 核心组件
-
-- **执行器 (Enforcer)**：系统核心，负责权限检查的统一入口，集成熔断器和重试机制
-- **匹配引擎 (Matcher)**：基于 go-toolbox/matcher 的高性能规则匹配引擎，支持复杂表达式解析
-- **模型管理 (Model)**：处理权限模型的加载、验证和解析，支持多种权限模型
-- **策略管理 (Policy)**：管理权限策略的存储、加载和更新，支持多种存储后端
-- **角色管理 (Role)**：处理角色层级关系，支持角色继承和多租户隔离
-
-### 扩展能力
-
-- **适配器系统**：基于接口的适配器模式，支持文件、内存、数据库等多种存储后端
-- **监控体系**：集成指标收集和健康检查，提供系统运行状态的可视化
-- **企业级特性**：熔断、重试、分布式追踪、结构化日志等企业级功能
-- **多租户支持**：基于域的多租户隔离方案，支持复杂的权限隔离需求
-
 ## ⚡ 性能优化
 
 go-casbin 在热路径上做了多层优化，核心思路是**编译一次、缓存复用、池化零分配**：
@@ -241,7 +259,6 @@ go-casbin 在热路径上做了多层优化，核心思路是**编译一次、�
 - **syncx.Pool 对象复用**：requestMap / MatchContext / funcArgs / 缓存键全部池化，降低 GC 压力
 - **resolveVarInline**：compiledNode.eval 内联 map 查找 + valueToString 类型断言，99% 场景零函数调用
 - **短路优化**：some(where(p.eft==allow)) 匹配到第一条 allow 即返回
-- **死锁防护**：notifyPolicyChange 移出锁外、SetNotifier 锁外 Close/Subscribe
 
 基准测试覆盖 28 个场景（缓存命中/未命中、RBAC/ABAC/多租户、并发读写、策略重载等），详见 `enforcer_bench_test.go`
 
@@ -281,20 +298,6 @@ func main() {
     log.InfoKV("权限检查结果", "sub", "alice", "obj", "data1", "act", "read", "ok", ok)
 }
 ```
-
-### 详细使用指南
-
-更多详细的使用示例和指南，请参考 `docs/` 目录：
-
-- [快速开始](docs/quickstart.md) - 一步一步教你使用 go-casbin
-- [入门指南](docs/getting-started.md) - 从安装到基本使用的完整指南
-- [模型配置指南](docs/model-config.md) - 详细的模型配置语法和示例
-- [策略管理指南](docs/policy-management.md) - 策略的加载、保存、添加、删除和更新
-- [角色管理指南](docs/role-management.md) - 角色的创建、继承、查询和管理
-- [多租户指南](docs/multitenancy.md) - 多租户隔离方案和实现方法
-- [适配器使用指南](docs/adapters.md) - 各种存储适配器的使用方法
-- [高级特性指南](docs/advanced-features.md) - 熔断、重试、分布式追踪等企业级功能
-- [实时风控与反黑产](docs/risk-control.md) - 实时风险评估和反黑产操作
 
 ## 📂 可运行示例
 
