@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/kamalyes/go-logger v0.9.0
-	github.com/kamalyes/go-toolbox v0.19.1
+	github.com/kamalyes/go-toolbox v0.19.2
 	github.com/stretchr/testify v1.12.1
 )
 
