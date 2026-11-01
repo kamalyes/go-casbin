@@ -49,7 +49,7 @@ type enforceCacheGen struct {
 //   - Store：写 current，发现 current 到期先轮转
 //   - Invalidate：版本号递增 + 两代立即重建，策略变更后全局 miss 且内存即时回收
 type generationalEnforceCache struct {
-	mu      sync.Mutex                 // 仅序列化轮转/失效的交换动作
+	mu      sync.Mutex // 仅序列化轮转/失效的交换动作
 	current atomic.Pointer[enforceCacheGen]
 	prev    atomic.Pointer[enforceCacheGen]
 	version atomic.Uint64

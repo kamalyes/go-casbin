@@ -16,8 +16,9 @@ package role
 // 每个角色维护一个直接继承的角色列表（links），形成有向图
 //
 // 典型用法：
-//   admin → editor → viewer 构成继承链
-//   alice 继承 admin，则 alice 也拥有 editor 和 viewer 的权限
+//
+//	admin → editor → viewer 构成继承链
+//	alice 继承 admin，则 alice 也拥有 editor 和 viewer 的权限
 type Role interface {
 	Name() string              // 获取角色名称
 	AddLink(name2 string)      // 添加角色继承链接（name 继承 name2）

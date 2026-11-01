@@ -671,7 +671,7 @@ func (me *MatcherEngine) resolveValue(token string, vars map[string]interface{})
 			prefix := strings.Join(parts[:i], ".")
 			if root, ok := vars[prefix]; ok {
 				remaining := strings.Join(parts[i:], ".")
-				accessor := safe.Safe(root)
+				accessor := safe.New(root)
 				result := accessor.Field(remaining)
 				if result.IsValid() {
 					return result.Value()
@@ -679,7 +679,7 @@ func (me *MatcherEngine) resolveValue(token string, vars map[string]interface{})
 				// 尝试逐级访问
 				current := root
 				for j := i; j < len(parts); j++ {
-					a := safe.Safe(current)
+					a := safe.New(current)
 					r := a.Field(parts[j])
 					if !r.IsValid() {
 						break

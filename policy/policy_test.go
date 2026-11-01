@@ -1218,7 +1218,10 @@ type removeFailBasicAdapter struct {
 
 func (a *removeFailBasicAdapter) LoadPolicy() ([]string, error) { return a.policies, nil }
 func (a *removeFailBasicAdapter) SavePolicy(p []string) error   { a.policies = p; return nil }
-func (a *removeFailBasicAdapter) AddPolicy(line string) error   { a.policies = append(a.policies, line); return nil }
+func (a *removeFailBasicAdapter) AddPolicy(line string) error {
+	a.policies = append(a.policies, line)
+	return nil
+}
 func (a *removeFailBasicAdapter) RemovePolicy(line string) error {
 	return errors.NewPolicyAdapterFailedError("remove failed")
 }
@@ -1228,11 +1231,11 @@ type updatableOnlyFailAdapter struct {
 	failUpdateFiltered bool
 }
 
-func (a *updatableOnlyFailAdapter) LoadPolicy() ([]string, error)                  { return nil, nil }
-func (a *updatableOnlyFailAdapter) SavePolicy(policies []string) error             { return nil }
-func (a *updatableOnlyFailAdapter) AddPolicy(line string) error                    { return nil }
-func (a *updatableOnlyFailAdapter) RemovePolicy(line string) error                 { return nil }
-func (a *updatableOnlyFailAdapter) UpdatePolicy(oldLine, newLine string) error     { return nil }
+func (a *updatableOnlyFailAdapter) LoadPolicy() ([]string, error)                    { return nil, nil }
+func (a *updatableOnlyFailAdapter) SavePolicy(policies []string) error               { return nil }
+func (a *updatableOnlyFailAdapter) AddPolicy(line string) error                      { return nil }
+func (a *updatableOnlyFailAdapter) RemovePolicy(line string) error                   { return nil }
+func (a *updatableOnlyFailAdapter) UpdatePolicy(oldLine, newLine string) error       { return nil }
 func (a *updatableOnlyFailAdapter) UpdatePolicies(oldLines, newLines []string) error { return nil }
 func (a *updatableOnlyFailAdapter) UpdateFilteredPolicies(newLines []string, fieldIndex int, fieldValues ...string) error {
 	if a.failUpdateFiltered {

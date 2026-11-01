@@ -147,7 +147,6 @@ func TestExtractPType(t *testing.T) {
 	assert.Equal(t, "", ExtractPType(""))
 }
 
-
 func TestInferPType(t *testing.T) {
 	tests := []struct {
 		name  string
