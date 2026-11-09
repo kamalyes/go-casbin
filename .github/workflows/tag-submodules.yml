@@ -1,0 +1,60 @@
+name: 📦 Tag Submodules
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "已推送的根模块版本，例如 v0.3.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-submodules-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: 🏷️ Validate and tag all submodules
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ROOT_VERSION: ${{ inputs.version || github.ref_name }}
+      GOTOOLCHAIN: local
+    steps:
+      - name: 📥 Checkout root release
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.version || github.ref }}
+          fetch-depth: 0
+
+      - name: 🛠️ Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - name: 🧪 Validate source and release automation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -s -l .)"
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+          for module in . adapter/base adapter/gorm adapter/kafka adapter/nats adapter/redis; do
+            (
+              cd "$module"
+              export GOWORK=off
+              go build -mod=readonly ./...
+              go vet -mod=readonly ./...
+              go test -mod=readonly -race -shuffle=on -timeout=10m ./...
+            )
+          done
+
+      - name: 🏷️ Pin base dependency and publish matching tags atomically
+        shell: bash
+        run: python3 .github/scripts/tag_submodules.py "$ROOT_VERSION"

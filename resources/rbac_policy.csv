@@ -1,11 +1,5 @@
-p, alice, data1, read
-p, alice, data1, write
-p, bob, data2, read
-p, admin, data1, read
-p, admin, data1, write
-p, admin, data2, read
-p, admin, data2, write
+p, admin, /v1/users/*, GET
+p, admin, /v1/users, POST
+p, viewer, /v1/users/*, GET
 g, alice, admin
 g, bob, viewer
-p, anonymous, /v1/login, POST
-p, anonymous, /v1/register, POST

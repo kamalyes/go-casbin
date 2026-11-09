@@ -26,6 +26,19 @@ on:
 jobs:
   test:
     uses: kamalyes/deploy-pipeline/.github/workflows/go-library-test.yml@master
+    with:
+      post-test-script: |
+        set -euo pipefail
+        python -m unittest discover -s .github/scripts -p 'test_*.py' -v
+        for module in adapter/base adapter/gorm adapter/kafka adapter/nats adapter/redis; do
+          (
+            cd "$module"
+            export GOWORK=off GOTOOLCHAIN=local
+            go build -mod=readonly ./...
+            go vet -mod=readonly ./...
+            go test -mod=readonly -race -shuffle=on -timeout=10m ./...
+          )
+        done
     secrets:
       # 显式映射而非 secrets: inherit —— inherit 跨账号调用时拿不到值
       # [EN] Mapped explicitly rather than with secrets: inherit, which yields nothing across accounts

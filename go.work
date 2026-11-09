@@ -1,0 +1,12 @@
+go 1.25.0
+
+// 本地开发用：让根模块与各适配器子模块互相引用本地代码，
+// 不必等 tag 发布。提交到仓库即可，CI 里按模块单独 build 不受影响。
+use (
+	.
+	./adapter/base
+	./adapter/gorm
+	./adapter/kafka
+	./adapter/nats
+	./adapter/redis
+)

@@ -1,7 +1,0 @@
-p, admin, tenant1, data1, read
-p, admin, tenant1, data1, write
-p, admin, tenant2, data2, read
-p, viewer, tenant2, data2, read
-g, alice, admin, tenant1
-g, alice, viewer, tenant2
-g, bob, viewer, tenant1
