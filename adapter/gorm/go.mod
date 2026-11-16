@@ -1,6 +1,6 @@
 module github.com/kamalyes/go-casbin/adapter/gorm
 
-go 1.25.0
+go 1.26.0
 
 require github.com/kamalyes/go-casbin/adapter/base v0.0.0
 
@@ -28,10 +28,11 @@ require (
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/mattn/go-isatty v0.0.17 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
-	golang.org/x/crypto v0.31.0 // indirect
-	golang.org/x/sync v0.10.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	modernc.org/libc v1.22.5 // indirect
 	modernc.org/mathutil v1.5.0 // indirect
 	modernc.org/memory v1.5.0 // indirect
