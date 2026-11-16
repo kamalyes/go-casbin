@@ -28,7 +28,7 @@ jobs:
       GOTOOLCHAIN: local
     steps:
       - name: 📥 Checkout root release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.version || github.ref }}
           fetch-depth: 0
